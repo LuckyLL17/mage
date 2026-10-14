@@ -107,6 +107,54 @@ func (f Function) TargetName() string {
 	return strings.Join(names, ":")
 }
 
+// CLITargetName returns the lower-cased form of TargetName as typed on the
+// command line.
+func (f Function) CLITargetName() string {
+	return strings.ToLower(f.TargetName())
+}
+
+// FuncName returns the fully qualified runtime function name of the target,
+// e.g. "main.Build", "main.NS.Build" or
+// "github.com/acme/deploy.NS.Build". It matches the name reported by
+// runtime.FuncForPC and mg.Fn.Name.
+func (f Function) FuncName() string {
+	pkg := f.ImportPath
+	if pkg == "" {
+		pkg = "main"
+	}
+	if f.Receiver != "" {
+		return fmt.Sprintf("%s.%s.%s", pkg, f.Receiver, f.Name)
+	}
+	return fmt.Sprintf("%s.%s", pkg, f.Name)
+}
+
+// NamespaceName returns the lower-cased namespace prefix of the CLI target
+// name, e.g. "deploy" for "deploy:ships". It is empty for top-level
+// targets.
+func (f Function) NamespaceName() string {
+	target := f.CLITargetName()
+	if i := strings.LastIndex(target, ":"); i >= 0 {
+		return target[:i]
+	}
+	return ""
+}
+
+// AliasNames returns the sorted CLI aliases declared for this exact function
+// in the magefile's Aliases map.
+func (f Function) AliasNames(aliases map[string]*Function) []string {
+	var out []string
+	for alias, af := range aliases {
+		if af == nil {
+			continue
+		}
+		if af.FuncName() == f.FuncName() {
+			out = append(out, alias)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // NumRequiredArgs returns the number of non-optional arguments.
 func (f Function) NumRequiredArgs() int {
 	n := 0
@@ -379,9 +427,11 @@ func (f Function) ExecCode() string {
 				}`, f.TargetName())
 	}
 
-	out := parseargs.String() + `
+	out := parseargs.String() + fmt.Sprintf(`
+				_mageReq := _mageTargetRequest{Target: %q, Func: %q, Namespace: %q, Alias: _mageAdmitAlias, Args: args.Args[_mageArgsStart:x]}
 				wrapFn := func(ctx _context.Context) error {
-					`
+					return _mageAdmitRun(ctx, _mageReq, func(ctx _context.Context) error {
+					`, f.CLITargetName(), f.FuncName(), f.NamespaceName())
 	if f.IsError {
 		out += "return "
 	}
@@ -397,9 +447,10 @@ func (f Function) ExecCode() string {
 	out += ")"
 	if !f.IsError {
 		out += `
-					return nil`
+						return nil`
 	}
 	out += `
+					})
 				}
 				ret := runTarget(logger, wrapFn)`
 	return out

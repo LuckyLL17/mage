@@ -1,0 +1,6 @@
+{
+  "defaultAction": "allow",
+  "rules": [
+    {"action": "deny", "namespace": "ns", "reason": "namespace targets are restricted"}
+  ]
+}

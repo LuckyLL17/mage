@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	_ "embed" // so we can use //go:embed for the magefile template and colors
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -96,29 +97,30 @@ func Main() int {
 
 // Invocation contains the args for invoking a run of Mage.
 type Invocation struct {
-	Debug        bool          // turn on debug messages
-	Dir          string        // directory to read magefiles from
-	WorkDir      string        // directory where magefiles will run
-	Force        bool          // forces recreation of the compiled binary
-	Verbose      bool          // tells the magefile to print out log statements
-	List         bool          // tells the magefile to print out a list of targets
-	Help         bool          // tells the magefile to print out help for a specific target
-	Keep         bool          // tells mage to keep the generated main file after compiling
-	Timeout      time.Duration // tells mage to set a timeout to running the targets
-	CompileOut   string        // tells mage to compile a static binary to this path, but not execute
-	GOOS         string        // sets the GOOS when producing a binary with -compileout
-	GOARCH       string        // sets the GOARCH when producing a binary with -compileout
-	Ldflags      string        // sets the ldflags when producing a binary with -compileout
-	Stdout       io.Writer     // writer to write stdout messages to
-	Stderr       io.Writer     // writer to write stderr messages to
-	Stdin        io.Reader     // reader to read stdin from
-	Args         []string      // args to pass to the compiled binary
-	GoCmd        string        // the go binary command to run
-	CacheDir     string        // the directory where we should store compiled binaries
-	HashFast     bool          // don't rely on GOCACHE, just hash the magefiles
-	Multiline    bool          // whether to retain line returns in help text for the generated main file
-	Autocomplete bool          // parse magefiles and print target names for shell completion
-	InstallShell string        // shell to install tab completion for (bash, zsh, fish, powershell/pwsh)
+	Debug           bool          // turn on debug messages
+	Dir             string        // directory to read magefiles from
+	WorkDir         string        // directory where magefiles will run
+	Force           bool          // forces recreation of the compiled binary
+	Verbose         bool          // tells the magefile to print out log statements
+	List            bool          // tells the magefile to print out a list of targets
+	Help            bool          // tells the magefile to print out help for a specific target
+	Keep            bool          // tells mage to keep the generated main file after compiling
+	Timeout         time.Duration // tells mage to set a timeout to running the targets
+	CompileOut      string        // tells mage to compile a static binary to this path, but not execute
+	GOOS            string        // sets the GOOS when producing a binary with -compileout
+	GOARCH          string        // sets the GOARCH when producing a binary with -compileout
+	Ldflags         string        // sets the ldflags when producing a binary with -compileout
+	Stdout          io.Writer     // writer to write stdout messages to
+	Stderr          io.Writer     // writer to write stderr messages to
+	Stdin           io.Reader     // reader to read stdin from
+	Args            []string      // args to pass to the compiled binary
+	GoCmd           string        // the go binary command to run
+	CacheDir        string        // the directory where we should store compiled binaries
+	HashFast        bool          // don't rely on GOCACHE, just hash the magefiles
+	Multiline       bool          // whether to retain line returns in help text for the generated main file
+	Autocomplete    bool          // parse magefiles and print target names for shell completion
+	InstallShell    string        // shell to install tab completion for (bash, zsh, fish, powershell/pwsh)
+	AdmissionPolicy string        // path to an optional target admission policy file (passed to the compiled magefile)
 }
 
 // MagefilesDirName is the name of the default folder to look for if no directory was specified,
@@ -230,6 +232,7 @@ func Parse(stderr, stdout io.Writer, args []string) (inv Invocation, cmd Command
 	fs.StringVar(&inv.GOOS, "goos", "", "set GOOS for binary produced with -compile")
 	fs.StringVar(&inv.GOARCH, "goarch", "", "set GOARCH for binary produced with -compile")
 	fs.StringVar(&inv.Ldflags, "ldflags", "", "set ldflags for binary produced with -compile")
+	fs.StringVar(&inv.AdmissionPolicy, "admission", os.Getenv(mg.AdmissionPolicyEnv), "path to a target admission policy file that allows or denies targets by identity, namespace, alias, args and working directory")
 	fs.BoolVar(&inv.Autocomplete, "autocomplete", false, "print target names for shell completion, without compiling")
 
 	// commands below
@@ -266,6 +269,9 @@ Commands:
   -version  show version info for the mage binary
 
 Options:
+  -admission <string>
+            path to a target admission policy file that allows or denies
+            targets by identity, namespace, alias, args and working directory
   -d <string> 
               directory to read magefiles from (default "." or "magefiles" if exists)
   -debug      turn on debug messages
@@ -363,6 +369,8 @@ var colorsFile string
 
 // Invoke runs Mage with the given arguments.
 func Invoke(inv Invocation) int {
+	// reset per-process state from any previous embedded invocation.
+	admissionTargetsEnv = ""
 	errlog := log.New(inv.Stderr, "", 0)
 	if inv.GoCmd == "" {
 		inv.GoCmd = "go"
@@ -372,6 +380,14 @@ func Invoke(inv Invocation) int {
 	}
 	if inv.WorkDir == "" {
 		inv.WorkDir = inv.Dir
+	}
+	// The compiled magefile runs with the magefile directory as its working
+	// directory, so a relative policy path must be resolved from this
+	// process' directory before it is handed over.
+	if inv.AdmissionPolicy != "" && !filepath.IsAbs(inv.AdmissionPolicy) {
+		if abs, err := filepath.Abs(inv.AdmissionPolicy); err == nil {
+			inv.AdmissionPolicy = abs
+		}
 	}
 	magefilesDir := filepath.Join(inv.Dir, MagefilesDirName)
 	// . will be default unless we find a mage folder.
@@ -470,6 +486,8 @@ func Invoke(inv Invocation) int {
 	// reproducible output for deterministic builds
 	sort.Sort(info.Funcs)
 	sort.Sort(info.Imports)
+
+	admissionTargetsEnv = admissionTargets(info)
 
 	binaryName := "mage"
 	if inv.CompileOut != "" {
@@ -701,6 +719,44 @@ type mainfileTemplateData struct {
 	Imports       []*parse.Import
 	BinaryName    string
 	PrintNameFunc string
+}
+
+// admissionTargetsEnv holds the JSON target registry handed to one compiled
+// invocation. It is empty when the magefiles were not reparsed (for example
+// when a cached binary is reused), in which case mg falls back to runtime
+// function names.
+var admissionTargetsEnv string
+
+// admissionTargets serializes the parsed target registry (keyed by fully
+// qualified runtime function name) for the mg dependency scheduler in the
+// compiled binary.
+func admissionTargets(info *parse.PkgInfo) string {
+	type targetInfo struct {
+		Target    string   `json:"Target"`
+		Namespace string   `json:"Namespace"`
+		Aliases   []string `json:"Aliases"`
+	}
+	targets := map[string]targetInfo{}
+	add := func(f *parse.Function) {
+		targets[f.FuncName()] = targetInfo{
+			Target:    f.CLITargetName(),
+			Namespace: f.NamespaceName(),
+			Aliases:   f.AliasNames(info.Aliases),
+		}
+	}
+	for _, f := range info.Funcs {
+		add(f)
+	}
+	for _, imp := range info.Imports {
+		for _, f := range imp.Info.Funcs {
+			add(f)
+		}
+	}
+	raw, err := json.Marshal(targets)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
 }
 
 // listGoFiles returns a list of all .go files in a given directory,
@@ -961,6 +1017,12 @@ func RunCompiled(inv Invocation, exePath string, errlog *log.Logger) int {
 	}
 	if inv.Timeout > 0 {
 		c.Env = append(c.Env, fmt.Sprintf("MAGEFILE_TIMEOUT=%s", inv.Timeout.String()))
+	}
+	if inv.AdmissionPolicy != "" {
+		c.Env = append(c.Env, fmt.Sprintf("%s=%s", mg.AdmissionPolicyEnv, inv.AdmissionPolicy))
+	}
+	if admissionTargetsEnv != "" {
+		c.Env = append(c.Env, fmt.Sprintf("%s=%s", mg.AdmissionTargetsEnv, admissionTargetsEnv))
 	}
 	debug.Print("running magefile with mage vars:\n", strings.Join(filter(c.Env, "MAGEFILE"), "\n"))
 	// catch SIGINT to allow magefile to handle them

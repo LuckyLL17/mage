@@ -39,6 +39,7 @@ func (o *onceMap) LoadOrStore(f Fn) *onceFun {
 		once:        &sync.Once{},
 		fn:          f,
 		displayName: displayName(f.Name()),
+		req:         dependencyRequest(f),
 	}
 	o.m[key] = one
 	return one
@@ -108,6 +109,17 @@ func CtxDeps(ctx context.Context, fns ...interface{}) {
 
 // runDeps assumes you've already called checkFns.
 func runDeps(ctx context.Context, fns []Fn) {
+	if activePolicy() == nil {
+		runDepsUnchecked(ctx, fns)
+		return
+	}
+	runDepsChecked(ctx, fns)
+}
+
+// runDepsUnchecked is the legacy scheduler used when no admission policy is
+// configured. It must stay behaviorally identical to the original
+// implementation.
+func runDepsUnchecked(ctx context.Context, fns []Fn) {
 	mu := &sync.Mutex{}
 	var errs []string
 	var exit int
@@ -142,6 +154,86 @@ func runDeps(ctx context.Context, fns []Fn) {
 	if len(errs) > 0 {
 		panic(Fatal(exit, strings.Join(errs, "\n")))
 	}
+}
+
+// runDepsChecked is the scheduler used when an admission policy is active.
+// It enforces four deterministic guarantees:
+//
+//   - every direct dependency of this call is admitted before any of them
+//     starts, so a rejected sibling never runs as a side effect;
+//   - a rejected dependency (and the nodes it would have scheduled) never
+//     starts, while the caller panics and its own continuation is skipped;
+//   - after cancellation no new node starts;
+//   - rejection explanations carry the chain from the requested root target
+//     to each rejected node.
+func runDepsChecked(ctx context.Context, fns []Fn) {
+	if err := ctx.Err(); err != nil {
+		panic(Fatal(ExitStatus(err), err.Error()))
+	}
+
+	entries := make([]*onceFun, len(fns))
+	for i, f := range fns {
+		entries[i] = onces.LoadOrStore(f)
+	}
+
+	parent := parentChain()
+
+	// Preflight in source order so the rejection explanation is stable
+	// regardless of goroutine scheduling.
+	var denials []*Denial
+	chains := make([][]ChainLink, len(entries))
+	for i, fn := range entries {
+		req := withWorkDir(fn.req)
+		chains[i] = appendChainLink(parent, req)
+		if d := admit(parent, req); d != nil {
+			denials = append(denials, d)
+		}
+	}
+	if len(denials) > 0 {
+		panic(&admissionError{denials: denials})
+	}
+
+	mu := &sync.Mutex{}
+	var errs []string
+	var exit int
+	wg := &sync.WaitGroup{}
+	for i, fn := range entries {
+		fn := fn
+		chain := chains[i]
+		wg.Add(1)
+		go func() {
+			defer func() {
+				if v := recover(); v != nil {
+					mu.Lock()
+					if err, ok := v.(error); ok {
+						exit = changeExit(exit, ExitStatus(err))
+					} else {
+						exit = changeExit(exit, 1)
+					}
+					errs = append(errs, fmt.Sprint(v))
+					mu.Unlock()
+				}
+				wg.Done()
+			}()
+			if err := fn.runChecked(ctx, chain); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Sprint(err))
+				exit = changeExit(exit, ExitStatus(err))
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	if len(errs) > 0 {
+		panic(Fatal(exit, strings.Join(errs, "\n")))
+	}
+}
+
+func appendChainLink(parent []ChainLink, req TargetRequest) []ChainLink {
+	chain := make([]ChainLink, 0, len(parent)+1)
+	chain = append(chain, parent...)
+	return append(chain, ChainLink{Request: req})
 }
 
 func checkFns(fns []interface{}) []Fn {
@@ -215,12 +307,38 @@ type onceFun struct {
 	err  error
 
 	displayName string
+	req         TargetRequest
 }
 
 // run will run the function exactly once and capture the error output. Further runs simply return
 // the same error output.
 func (o *onceFun) run(ctx context.Context) error {
 	o.once.Do(func() {
+		if Verbose() {
+			logger.Println("Running dependency:", displayName(o.fn.Name()))
+		}
+		o.err = o.fn.Run(ctx)
+	})
+	return o.err
+}
+
+// runChecked is run when an admission policy is active. The caller already
+// admitted this dependency for the current batch; the admission is evaluated
+// again here so that the single winning goroutine uses the one shared
+// decision and a shared dependency can never run merely because another
+// caller reached it first.
+func (o *onceFun) runChecked(ctx context.Context, chain []ChainLink) error {
+	o.once.Do(func() {
+		req := withWorkDir(o.req)
+		// The last link of chain is this very dependency; rebuild the
+		// denial on top of its admitted ancestors.
+		if d := admit(chain[:len(chain)-1], req); d != nil {
+			o.err = d
+			return
+		}
+		gid := goroutineID()
+		setAmbientChain(gid, chain)
+		defer clearAmbientChain(gid)
 		if Verbose() {
 			logger.Println("Running dependency:", displayName(o.fn.Name()))
 		}

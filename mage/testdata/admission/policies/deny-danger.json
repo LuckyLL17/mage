@@ -1,0 +1,6 @@
+{
+  "defaultAction": "allow",
+  "rules": [
+    {"action": "deny", "target": "danger", "reason": "danger is forbidden in shared CI"}
+  ]
+}

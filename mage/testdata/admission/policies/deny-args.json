@@ -1,0 +1,6 @@
+{
+  "defaultAction": "allow",
+  "rules": [
+    {"action": "deny", "target": "greet", "args": ["admin"], "reason": "greeting admin is not allowed"}
+  ]
+}

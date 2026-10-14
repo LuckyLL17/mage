@@ -1,0 +1,6 @@
+{
+  "defaultAction": "allow",
+  "rules": [
+    {"action": "deny", "target": "shared", "reason": "shared dependency is not authorized"}
+  ]
+}

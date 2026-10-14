@@ -1,0 +1,6 @@
+{
+  "defaultAction": "allow",
+  "rules": [
+    {"action": "deny", "func": "main.Danger", "reason": "function identity is pinned"}
+  ]
+}

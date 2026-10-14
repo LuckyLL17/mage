@@ -1,0 +1,6 @@
+{
+  "defaultAction": "deny",
+  "rules": [
+    {"action": "allow", "target": "build"}
+  ]
+}

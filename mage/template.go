@@ -23,9 +23,241 @@ import (
 	_syscall "syscall"
 	_tabwriter "text/tabwriter"
 	_time "time"
+	_json "encoding/json"
+	_sync "sync"
 	{{range .Imports}}{{.UniqueName}} "{{.Path}}"
 	{{end}}
 )
+
+// Target admission is inlined here (stdlib only) so the generated main file
+// never introduces a new non-stdlib import. The logic is required to stay
+// identical to github.com/magefile/mage/mg's policy implementation: the same
+// MAGEFILE_ADMISSION_POLICY file, selectors, denial messages and exit status.
+// Transitive dependencies are gated by the mg scheduler itself, using the same
+// policy file; the running root identity is published for mg via
+// MAGEFILE_ADMISSION_ROOT.
+const _mageAdmissionDeniedExitCode = 77
+
+type _mageTargetRequest struct {
+	Target    string
+	Func      string
+	Namespace string
+	Alias     string
+	Args      []string
+	Dir       string
+}
+
+type _mageRule struct {
+	Action     string
+	Target     string
+	Func       string
+	Namespace  string
+	Alias      string
+	Args       []string
+	ArgsPrefix []string
+	Dir        string
+	Reason     string
+}
+
+type _magePolicy struct {
+	DefaultAction string
+	Rules         []_mageRule
+}
+
+type _mageDenied struct {
+	req   _mageTargetRequest
+	rule  _mageRule
+	index int
+}
+
+func (d *_mageDenied) Error() string {
+	var b _strings.Builder
+	b.WriteString("target admission denied: ")
+	b.WriteString(_mageDescribeRequest(d.req))
+	b.WriteString(" rejected by ")
+	if d.index > 0 {
+		_fmt.Fprintf(&b, "%s rule %d", d.rule.Action, d.index)
+	} else {
+		b.WriteString("default action")
+	}
+	if d.rule.Reason != "" {
+		b.WriteString(": ")
+		b.WriteString(d.rule.Reason)
+	}
+	return b.String()
+}
+
+func (d *_mageDenied) ExitStatus() int { return _mageAdmissionDeniedExitCode }
+
+func _mageDescribeRequest(req _mageTargetRequest) string {
+	var b _strings.Builder
+	if req.Target != "" {
+		_fmt.Fprintf(&b, "target %q", req.Target)
+	} else {
+		_fmt.Fprintf(&b, "dependency %q", req.Func)
+	}
+	if req.Alias != "" {
+		_fmt.Fprintf(&b, " (alias %q)", req.Alias)
+	}
+	if req.Func != "" {
+		_fmt.Fprintf(&b, " [func %s]", req.Func)
+	}
+	if len(req.Args) > 0 {
+		_fmt.Fprintf(&b, " args=%v", req.Args)
+	}
+	if req.Dir != "" {
+		_fmt.Fprintf(&b, " dir=%q", req.Dir)
+	}
+	return b.String()
+}
+
+var (
+	_magePolicyOnce _sync.Once
+	_magePolicyData *_magePolicy
+)
+
+func _mageLoadPolicy() *_magePolicy {
+	_magePolicyOnce.Do(func() {
+		path := _os.Getenv("MAGEFILE_ADMISSION_POLICY")
+		if path == "" {
+			return
+		}
+		fail := func(msg string) {
+			_magePolicyData = &_magePolicy{DefaultAction: "deny"}
+			_magePolicyData.Rules = append(_magePolicyData.Rules, _mageRule{Action: "deny", Reason: msg})
+		}
+		f, err := _os.Open(path)
+		if err != nil {
+			fail("admission policy could not be loaded: " + err.Error())
+			return
+		}
+		var p _magePolicy
+		dec := _json.NewDecoder(f)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&p); err != nil {
+			_ = f.Close()
+			fail("admission policy could not be loaded: " + err.Error())
+			return
+		}
+		_ = f.Close()
+		if p.DefaultAction != "" && p.DefaultAction != "allow" && p.DefaultAction != "deny" {
+			fail("admission policy could not be loaded: defaultAction must be \"allow\" or \"deny\"")
+			return
+		}
+		for i := range p.Rules {
+			if p.Rules[i].Action != "allow" && p.Rules[i].Action != "deny" {
+				fail("admission policy could not be loaded: every rule needs an \"allow\" or \"deny\" action")
+				return
+			}
+		}
+		_magePolicyData = &p
+	})
+	return _magePolicyData
+}
+
+func _mageNamespaceMatches(ruleNS, reqNS string) bool {
+	ruleNS = _strings.ToLower(ruleNS)
+	reqNS = _strings.ToLower(reqNS)
+	return ruleNS == reqNS || _strings.HasPrefix(reqNS, ruleNS+":")
+}
+
+func _mageEqualStrings(want, got []string) bool {
+	if len(want) != len(got) {
+		return false
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func _mageHasPrefixArgs(args, prefix []string) bool {
+	if len(args) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if args[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *_mageRule) matches(req _mageTargetRequest) bool {
+	if r.Target != "" && !_strings.EqualFold(r.Target, req.Target) {
+		return false
+	}
+	if r.Func != "" {
+		if ok, _ := _filepath.Match(r.Func, req.Func); !ok {
+			return false
+		}
+	}
+	if r.Namespace != "" && !_mageNamespaceMatches(r.Namespace, req.Namespace) {
+		return false
+	}
+	if r.Alias != "" && !_strings.EqualFold(r.Alias, req.Alias) {
+		return false
+	}
+	if r.Args != nil && !_mageEqualStrings(r.Args, req.Args) {
+		return false
+	}
+	if len(r.ArgsPrefix) > 0 && !_mageHasPrefixArgs(req.Args, r.ArgsPrefix) {
+		return false
+	}
+	if r.Dir != "" {
+		if ok, _ := _filepath.Match(r.Dir, _filepath.Clean(req.Dir)); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// _magePublishRoot publishes the admitted root identity so the mg dependency
+// scheduler can explain a rejected transitive node from the requested target.
+func _magePublishRoot(req _mageTargetRequest) {
+	root, err := _json.Marshal(req)
+	if err == nil {
+		_ = _os.Setenv("MAGEFILE_ADMISSION_ROOT", string(root))
+	}
+}
+
+func _mageAdmitRun(ctx _context.Context, req _mageTargetRequest, run func(_context.Context) error) error {
+	p := _mageLoadPolicy()
+	if p == nil {
+		_magePublishRoot(req)
+		return run(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if wd, err := _os.Getwd(); err == nil {
+		if abs, err := _filepath.Abs(wd); err == nil {
+			wd = abs
+		}
+		if real, err := _filepath.EvalSymlinks(wd); err == nil {
+			wd = real
+		}
+		req.Dir = wd
+	}
+	for i := range p.Rules {
+		r := &p.Rules[i]
+		if !r.matches(req) {
+			continue
+		}
+		if r.Action == "deny" {
+			return &_mageDenied{req: req, rule: *r, index: i + 1}
+		}
+		_magePublishRoot(req)
+		return run(ctx)
+	}
+	if _strings.EqualFold(p.DefaultAction, "deny") {
+		return &_mageDenied{req: req, rule: _mageRule{Action: "deny", Reason: "default action is deny"}}
+	}
+	_magePublishRoot(req)
+	return run(ctx)
+}
 
 func main() {
 	// Use local types and functions in order to avoid name conflicts with additional magefiles.
@@ -290,6 +522,9 @@ Options:
 				_os.Exit(2)
 		}
 	}
+	_mageAdmitAlias := ""
+	_mageArgsStart := 0
+	_, _ = _mageAdmitAlias, _mageArgsStart
 	if len(args.Args) < 1 {
 	{{- if .DefaultFunc.Name}}
 		ignoreDefault, _ := _strconv.ParseBool(_os.Getenv("MAGEFILE_IGNOREDEFAULT"))
@@ -300,6 +535,7 @@ Options:
 			}
 			return
 		}
+		x := 0
 		{{.DefaultFunc.ExecCode}}
 		handleError(logger, ret)
 		return
@@ -316,12 +552,21 @@ Options:
 		x++
 
 		// resolve aliases
+		requestedTarget := _strings.ToLower(target)
 		switch _strings.ToLower(target) {
 		{{range $alias, $func := .Aliases}}
 			case "{{lower $alias}}":
 				target = "{{$func.TargetName}}"
 		{{- end}}
 		}
+		// record whether the target was requested through an alias, so the
+		// admission policy can match aliases as well as resolved targets.
+		if requestedTarget != _strings.ToLower(target) {
+			_mageAdmitAlias = requestedTarget
+		} else {
+			_mageAdmitAlias = ""
+		}
+		_mageArgsStart = x
 
 		switch _strings.ToLower(target) {
 		{{range .Funcs }}

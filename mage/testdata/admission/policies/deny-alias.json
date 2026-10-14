@@ -1,0 +1,6 @@
+{
+  "defaultAction": "allow",
+  "rules": [
+    {"action": "deny", "alias": "b", "reason": "aliases are pinned in shared CI"}
+  ]
+}

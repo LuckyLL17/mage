@@ -1,0 +1,6 @@
+{
+  "defaultAction": "allow",
+  "rules": [
+    {"action": "deny", "target": "pb", "reason": "one parallel branch is forbidden"}
+  ]
+}
