@@ -44,10 +44,28 @@ const EnableColorEnv = "MAGEFILE_ENABLE_COLOR"
 
 // MultilineEnv is the environment variable that indicates the user has
 // requested to preserve line breaks in help text generated from mage package
-// and target documentation comments. The default is false for backwards
+// and target documentation. The default is false for backwards
 // compatibility. When the value is true, newline characters in those
 // descriptions are retained in mage's help and list output.
 const MultilineEnv = "MAGEFILE_MULTILINE"
+
+// CheckpointEnv is the environment variable that explicitly enables target
+// checkpoints. When true, targets that run their body through
+// RunCheckpoint persist successful results and reuse them on later runs
+// while their project identity, target ID, arguments, working directory and
+// input fingerprint stay unchanged. Checkpoints are off by default.
+const CheckpointEnv = "MAGEFILE_CHECKPOINT"
+
+// CheckpointDirEnv is the environment variable that overrides the
+// directory where target checkpoint state is persisted. It defaults to a
+// "checkpoints" directory inside CacheDir.
+const CheckpointDirEnv = "MAGEFILE_CHECKPOINT_DIR"
+
+// ProjectIDEnv is the environment variable carrying the identity of the
+// compiled project and its mage:import closure. The mage command computes
+// it from the magefile and import contents and passes it to the compiled
+// magefile. A changed ID invalidates every persisted checkpoint.
+const ProjectIDEnv = "MAGEFILE_PROJECT_ID"
 
 // TargetColorEnv is the environment variable that indicates which ANSI color
 // should be used to colorize mage targets. This is only applicable when
@@ -104,6 +122,21 @@ func HashFast() bool {
 func Multiline() bool {
 	b, _ := strconv.ParseBool(os.Getenv(MultilineEnv))
 	return b
+}
+
+// CheckpointEnabled reports whether target checkpoints are explicitly
+// enabled for this run.
+func CheckpointEnabled() bool {
+	b, _ := strconv.ParseBool(os.Getenv(CheckpointEnv))
+	return b
+}
+
+// ProjectID returns the identity of the compiled project and its
+// mage:import closure, as injected by the mage command. It is empty when
+// mage did not provide one (for example when running a statically compiled
+// magefile directly).
+func ProjectID() string {
+	return os.Getenv(ProjectIDEnv)
 }
 
 // IgnoreDefault reports whether the user has requested to ignore the default target

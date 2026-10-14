@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -564,12 +565,19 @@ func getImport(gocmd, importpath, alias string, multiline bool) (*Import, error)
 	if err != nil {
 		return nil, err
 	}
+	goFiles := make([]string, 0, len(files))
+	for _, fn := range files {
+		if fn == "" {
+			continue
+		}
+		goFiles = append(goFiles, filepath.Join(dir, fn))
+	}
 	for i := range info.Funcs {
 		debug.Printf("setting alias %q and package %q on func %v", alias, name, info.Funcs[i].Name)
 		info.Funcs[i].PkgAlias = alias
 		info.Funcs[i].ImportPath = importpath
 	}
-	return &Import{Alias: alias, Name: name, Path: importpath, Info: *info}, nil
+	return &Import{Alias: alias, Name: name, Path: importpath, GoFiles: goFiles, Info: *info}, nil
 }
 
 // Import represents the data about a mage:import package.
@@ -578,7 +586,10 @@ type Import struct {
 	Name       string
 	UniqueName string // a name unique across all imports
 	Path       string
-	Info       PkgInfo
+	// GoFiles are the absolute paths of the Go source files making up the
+	// imported package, as reported by go list.
+	GoFiles []string
+	Info    PkgInfo
 }
 
 var _ sort.Interface = Imports(nil)

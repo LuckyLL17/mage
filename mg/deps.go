@@ -114,6 +114,12 @@ func runDeps(ctx context.Context, fns []Fn) {
 	wg := &sync.WaitGroup{}
 	for _, f := range fns {
 		fn := onces.LoadOrStore(f)
+		if CheckpointEnabled() {
+			// record the dependency edge so a successful parent persists
+			// the identity of the node it ran with, regardless of whether
+			// that child was executed or itself reused.
+			checkpoints.addEdge(nodeKeyFromContext(ctx), nodeKey(f.Name(), f.ID()))
+		}
 		wg.Add(1)
 		go func() {
 			defer func() {

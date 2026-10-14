@@ -119,6 +119,11 @@ type Invocation struct {
 	Multiline    bool          // whether to retain line returns in help text for the generated main file
 	Autocomplete bool          // parse magefiles and print target names for shell completion
 	InstallShell string        // shell to install tab completion for (bash, zsh, fish, powershell/pwsh)
+
+	// projectID is the content identity of the magefiles and their
+	// mage:import closure, injected into the compiled magefile as
+	// MAGEFILE_PROJECT_ID so target checkpoints invalidate on changes.
+	projectID string
 }
 
 // MagefilesDirName is the name of the default folder to look for if no directory was specified,
@@ -437,6 +442,7 @@ func Invoke(inv Invocation) int {
 		case err == nil:
 			if !inv.Force {
 				debug.Println("Running existing exe")
+				inv.projectID = projectIDForExisting(inv, files)
 				return RunCompiled(inv, exePath, errlog)
 			}
 			debug.Println("ignoring existing executable")
@@ -461,6 +467,12 @@ func Invoke(inv Invocation) int {
 	if err != nil {
 		errlog.Println("Error parsing magefiles:", err)
 		return 1
+	}
+
+	if pid, err := computeProjectID(files, info); err != nil {
+		debug.Printf("could not compute project identity for checkpoints: %v", err)
+	} else {
+		inv.projectID = pid
 	}
 
 	if inv.Autocomplete {
@@ -915,6 +927,76 @@ func hashFile(fn string) (string, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
+// computeProjectID returns a stable content identity for the magefiles and
+// their mage:import closure. Target checkpoints bind persisted results to
+// this identity, so editing a magefile or an imported mage package changes
+// the ID and forces checkpointed targets to rerun.
+func computeProjectID(primaryFiles []string, info *parse.PkgInfo) (string, error) {
+	type fileHash struct {
+		path string
+		sum  string
+	}
+	seen := map[string]bool{}
+	entries := make([]fileHash, 0)
+	add := func(path string) error {
+		if seen[path] {
+			return nil
+		}
+		seen[path] = true
+		sum, err := hashFile(path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, fileHash{path: path, sum: sum})
+		return nil
+	}
+	for _, f := range primaryFiles {
+		if err := add(f); err != nil {
+			return "", err
+		}
+	}
+	if info != nil {
+		for _, imp := range info.Imports {
+			for _, f := range imp.GoFiles {
+				if err := add(f); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
+	h := sha256.New()
+	for _, e := range entries {
+		fmt.Fprintf(h, "%s\x00%s\n", e.path, e.sum)
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+// projectIDForExisting computes the project identity when mage is about to
+// run an already compiled binary. The identity is only needed when target
+// checkpoints are explicitly enabled.
+func projectIDForExisting(inv Invocation, files []string) string {
+	if !mg.CheckpointEnabled() {
+		return ""
+	}
+	fnames := make([]string, 0, len(files))
+	for i := range files {
+		fnames = append(fnames, filepath.Base(files[i]))
+	}
+	var info *parse.PkgInfo
+	if parsed, err := parse.PrimaryPackage(inv.GoCmd, inv.Dir, fnames, inv.Multiline); err != nil {
+		debug.Printf("could not parse magefiles for checkpoint identity: %v", err)
+	} else {
+		info = parsed
+	}
+	pid, err := computeProjectID(files, info)
+	if err != nil {
+		debug.Printf("could not compute checkpoint project identity: %v", err)
+		return ""
+	}
+	return pid
+}
+
 func generateInit(dir string) error {
 	debug.Println("generating default magefile in", dir)
 	f, err := os.Create(filepath.Join(dir, initFile))
@@ -961,6 +1043,9 @@ func RunCompiled(inv Invocation, exePath string, errlog *log.Logger) int {
 	}
 	if inv.Timeout > 0 {
 		c.Env = append(c.Env, fmt.Sprintf("MAGEFILE_TIMEOUT=%s", inv.Timeout.String()))
+	}
+	if inv.projectID != "" {
+		c.Env = append(c.Env, mg.ProjectIDEnv+"="+inv.projectID)
 	}
 	debug.Print("running magefile with mage vars:\n", strings.Join(filter(c.Env, "MAGEFILE"), "\n"))
 	// catch SIGINT to allow magefile to handle them

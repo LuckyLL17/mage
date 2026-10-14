@@ -28,6 +28,7 @@ import (
 
 	"github.com/magefile/mage/internal"
 	"github.com/magefile/mage/mg"
+	"github.com/magefile/mage/parse"
 )
 
 const testExeEnv = "MAGE_TEST_STRING"
@@ -1205,6 +1206,85 @@ func TestHashTemplate(t *testing.T) {
 	}
 	if changed == name {
 		t.Fatal("expected executable name to chage if template changed")
+	}
+}
+
+// TestComputeProjectID ensures the checkpoint project identity covers the
+// primary magefiles and the mage:import closure, and changes when any of
+// them changes.
+func TestComputeProjectID(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "magefile.go")
+	imp := filepath.Join(dir, "imp.go")
+	write := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(root, "root v1")
+	write(imp, "import v1")
+
+	rootOnly, err := computeProjectID([]string{root}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rootOnly) != 64 {
+		t.Fatalf("expected sha256 hex id, got %q", rootOnly)
+	}
+
+	info := &parse.PkgInfo{Imports: parse.Imports{{GoFiles: []string{imp}}}}
+	withImport, err := computeProjectID([]string{root}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootOnly == withImport {
+		t.Fatal("project id must change when the import closure is part of the build")
+	}
+	if again, _ := computeProjectID([]string{root}, info); again != withImport {
+		t.Fatal("project id must be stable for unchanged inputs")
+	}
+
+	write(imp, "import v2")
+	if changed, _ := computeProjectID([]string{root}, info); changed == withImport {
+		t.Fatal("project id must change when an imported package changes")
+	}
+
+	write(root, "root v2")
+	write(imp, "import v1")
+	rootChanged, _ := computeProjectID([]string{root}, info)
+	if rootChanged == withImport {
+		t.Fatal("project id must change when a primary magefile changes")
+	}
+
+	if _, err := computeProjectID([]string{filepath.Join(dir, "missing.go")}, nil); err == nil {
+		t.Fatal("expected an error for an unreadable magefile")
+	}
+}
+
+// TestImportGoFilesCollected verifies that mage:import packages expose
+// their source files so the checkpoint project identity covers the import
+// closure.
+func TestImportGoFilesCollected(t *testing.T) {
+	info, err := parse.PrimaryPackage("go", "./testdata/mageimport", []string{"magefile.go"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Imports) != 2 {
+		t.Fatalf("expected 2 imports, got %d", len(info.Imports))
+	}
+	for _, imp := range info.Imports {
+		if len(imp.GoFiles) == 0 {
+			t.Fatalf("import %q reported no Go files", imp.Path)
+		}
+		for _, f := range imp.GoFiles {
+			if !filepath.IsAbs(f) {
+				t.Fatalf("expected absolute import file path, got %q", f)
+			}
+			if _, err := os.Stat(f); err != nil {
+				t.Fatalf("import file %q is not readable: %v", f, err)
+			}
+		}
 	}
 }
 
