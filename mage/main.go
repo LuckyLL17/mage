@@ -119,6 +119,20 @@ type Invocation struct {
 	Multiline    bool          // whether to retain line returns in help text for the generated main file
 	Autocomplete bool          // parse magefiles and print target names for shell completion
 	InstallShell string        // shell to install tab completion for (bash, zsh, fish, powershell/pwsh)
+
+	// Events, when non-nil, receives structured execution events for target
+	// selection, compilation, dependency expansion, target start, completion,
+	// skips, failures and the final exit. Events are best effort: a panicking
+	// or slow EventSink never changes mage's output, exit codes or dependency
+	// semantics. When nil, no structured events are produced and mage behaves
+	// exactly as without the field.
+	Events mg.EventSink
+
+	// eventLogPath and eventRunID wire the event forwarder to the compiled
+	// magefile subprocess.
+	eventLogPath string
+	eventRunID   string
+	forwarder    *eventForwarder
 }
 
 // MagefilesDirName is the name of the default folder to look for if no directory was specified,
@@ -361,8 +375,30 @@ const dotDirectory = "."
 //go:embed colors.go
 var colorsFile string
 
-// Invoke runs Mage with the given arguments.
+// Invoke runs Mage with the given arguments. When inv.Events is set, the
+// returned events describe the whole invocation, including compilation,
+// target execution and the final exit code.
 func Invoke(inv Invocation) int {
+	if inv.Events != nil {
+		if inv.CacheDir == "" {
+			inv.CacheDir = mg.CacheDir()
+		}
+		if forwarder := newEventForwarder(inv.Events, inv.CacheDir); forwarder != nil {
+			inv.forwarder = forwarder
+			inv.eventLogPath = forwarder.path
+			inv.eventRunID = forwarder.runID
+		}
+	}
+
+	code := invoke(inv)
+
+	if inv.forwarder != nil {
+		inv.forwarder.finish(code)
+	}
+	return code
+}
+
+func invoke(inv Invocation) int {
 	errlog := log.New(inv.Stderr, "", 0)
 	if inv.GoCmd == "" {
 		inv.GoCmd = "go"
@@ -524,9 +560,18 @@ func Invoke(inv Invocation) int {
 		defer func() { _ = os.RemoveAll(main) }()
 	}
 	files = append(files, main)
+	if inv.forwarder != nil {
+		inv.forwarder.compileStarted()
+	}
 	if err := Compile(inv.GOOS, inv.GOARCH, inv.Ldflags, inv.Dir, inv.GoCmd, exePath, files, inv.Debug, inv.Stderr, inv.Stdout); err != nil {
+		if inv.forwarder != nil {
+			inv.forwarder.compileFinished(err)
+		}
 		errlog.Println("Error:", err)
 		return 1
+	}
+	if inv.forwarder != nil {
+		inv.forwarder.compileFinished(nil)
 	}
 	if !inv.Keep {
 		// move aside this file before we run the compiled version, in case the
@@ -961,6 +1006,12 @@ func RunCompiled(inv Invocation, exePath string, errlog *log.Logger) int {
 	}
 	if inv.Timeout > 0 {
 		c.Env = append(c.Env, fmt.Sprintf("MAGEFILE_TIMEOUT=%s", inv.Timeout.String()))
+	}
+	if inv.eventLogPath != "" {
+		c.Env = append(c.Env,
+			mg.EventLogEnv+"="+inv.eventLogPath,
+			mg.EventRunIDEnv+"="+inv.eventRunID,
+		)
 	}
 	debug.Print("running magefile with mage vars:\n", strings.Join(filter(c.Env, "MAGEFILE"), "\n"))
 	// catch SIGINT to allow magefile to handle them

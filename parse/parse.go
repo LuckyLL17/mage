@@ -244,7 +244,7 @@ func (f Function) ExecCode() string {
 				arg%d, err := _strconv.Atoi(args.Args[x])
 				if err != nil {
 					logger.Printf("can't convert argument %%q to int\n", args.Args[x])
-					_os.Exit(2)
+					exit(2)
 				}
 				x++`, x)
 		case "float64":
@@ -252,7 +252,7 @@ func (f Function) ExecCode() string {
 				arg%d, err := _strconv.ParseFloat(args.Args[x], 64)
 				if err != nil {
 					logger.Printf("can't convert argument %%q to float64\n", args.Args[x])
-					_os.Exit(2)
+					exit(2)
 				}
 				x++`, x)
 		case "bool":
@@ -260,7 +260,7 @@ func (f Function) ExecCode() string {
 				arg%d, err := _strconv.ParseBool(args.Args[x])
 				if err != nil {
 					logger.Printf("can't convert argument %%q to bool\n", args.Args[x])
-					_os.Exit(2)
+					exit(2)
 				}
 				x++`, x)
 		case "time.Duration":
@@ -268,7 +268,7 @@ func (f Function) ExecCode() string {
 				arg%d, err := _time.ParseDuration(args.Args[x])
 				if err != nil {
 					logger.Printf("can't convert argument %%q to time.Duration\n", args.Args[x])
-					_os.Exit(2)
+					exit(2)
 				}
 				x++`, x)
 		default:
@@ -312,7 +312,7 @@ func (f Function) ExecCode() string {
 		_, _ = fmt.Fprintf(&parseargs, `
 						default:
 							logger.Printf("invalid option %%q for target \"%s\", expected -name=value format\n", _optArg)
-							_os.Exit(2)
+							exit(2)
 						}
 					} else {
 						_optName = _strings.ToLower(_optArg[1:_eqIdx])
@@ -336,7 +336,7 @@ func (f Function) ExecCode() string {
 						_tmp%d, err := _strconv.Atoi(_optVal)
 						if err != nil {
 							logger.Printf("can't convert option %%q value %%q to int\n", _optName, _optVal)
-							_os.Exit(2)
+							exit(2)
 						}
 						arg%d = &_tmp%d`, lowerName, x, x, x)
 			case "float64":
@@ -345,7 +345,7 @@ func (f Function) ExecCode() string {
 						_tmp%d, err := _strconv.ParseFloat(_optVal, 64)
 						if err != nil {
 							logger.Printf("can't convert option %%q value %%q to float64\n", _optName, _optVal)
-							_os.Exit(2)
+							exit(2)
 						}
 						arg%d = &_tmp%d`, lowerName, x, x, x)
 			case "bool":
@@ -354,7 +354,7 @@ func (f Function) ExecCode() string {
 						_tmp%d, err := _strconv.ParseBool(_optVal)
 						if err != nil {
 							logger.Printf("can't convert option %%q value %%q to bool\n", _optName, _optVal)
-							_os.Exit(2)
+							exit(2)
 						}
 						arg%d = &_tmp%d`, lowerName, x, x, x)
 			case "time.Duration":
@@ -363,7 +363,7 @@ func (f Function) ExecCode() string {
 						_tmp%d, err := _time.ParseDuration(_optVal)
 						if err != nil {
 							logger.Printf("can't convert option %%q value %%q to time.Duration\n", _optName, _optVal)
-							_os.Exit(2)
+							exit(2)
 						}
 						arg%d = &_tmp%d`, lowerName, x, x, x)
 			default:
@@ -373,11 +373,21 @@ func (f Function) ExecCode() string {
 		_, _ = fmt.Fprintf(&parseargs, `
 					default:
 						logger.Printf("unknown option %%q for target \"%s\"\n", _optName)
-						_os.Exit(2)
+						exit(2)
 					}
 					x++
 				}`, f.TargetName())
 	}
+
+	rootTargetID := f.ImportPath
+	if rootTargetID == "" {
+		rootTargetID = "main"
+	}
+	rootTargetID += "."
+	if f.Receiver != "" {
+		rootTargetID += f.Receiver + "."
+	}
+	rootTargetID += f.Name
 
 	out := parseargs.String() + `
 				wrapFn := func(ctx _context.Context) error {
@@ -399,9 +409,10 @@ func (f Function) ExecCode() string {
 		out += `
 					return nil`
 	}
-	out += `
+	out += fmt.Sprintf(`
 				}
-				ret := runTarget(logger, wrapFn)`
+				ret := runTarget(logger, mageTargetID{Name: %q, Display: %q}, wrapFn)`,
+		rootTargetID, strings.ToLower(f.TargetName()))
 	return out
 }
 

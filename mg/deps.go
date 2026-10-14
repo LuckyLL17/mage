@@ -39,6 +39,7 @@ func (o *onceMap) LoadOrStore(f Fn) *onceFun {
 		once:        &sync.Once{},
 		fn:          f,
 		displayName: displayName(f.Name()),
+		executionID: dependencyExecutionID(f),
 	}
 	o.m[key] = one
 	return one
@@ -69,9 +70,9 @@ func ResetDeps() {
 // shouldn't be run at the same time.
 func SerialDeps(fns ...interface{}) {
 	funcs := checkFns(fns)
-	ctx := context.Background()
+	ctx := ambientContext()
 	for i := range fns {
-		runDeps(ctx, funcs[i:i+1])
+		runDeps(ctx, funcs[i:i+1], false)
 	}
 }
 
@@ -81,7 +82,7 @@ func SerialDeps(fns ...interface{}) {
 func SerialCtxDeps(ctx context.Context, fns ...interface{}) {
 	funcs := checkFns(fns)
 	for i := range fns {
-		runDeps(ctx, funcs[i:i+1])
+		runDeps(ctx, funcs[i:i+1], false)
 	}
 }
 
@@ -103,17 +104,32 @@ func SerialCtxDeps(ctx context.Context, fns ...interface{}) {
 // prototype allows for it.
 func CtxDeps(ctx context.Context, fns ...interface{}) {
 	funcs := checkFns(fns)
-	runDeps(ctx, funcs)
+	runDeps(ctx, funcs, true)
 }
 
 // runDeps assumes you've already called checkFns.
-func runDeps(ctx context.Context, fns []Fn) {
+func runDeps(ctx context.Context, fns []Fn, parallel bool) {
+	parent := resolveFrame(ctx)
+	if parent != nil {
+		dependencies := make([]TargetID, len(fns))
+		for i, f := range fns {
+			dependencies[i] = TargetRef(f)
+		}
+		parent.state.emit(Event{
+			Kind:         EventDepsExpanded,
+			ExecutionID:  parent.execution,
+			Target:       parent.target,
+			Dependencies: dependencies,
+			Parallel:     parallel,
+		})
+	}
 	mu := &sync.Mutex{}
 	var errs []string
 	var exit int
 	wg := &sync.WaitGroup{}
 	for _, f := range fns {
 		fn := onces.LoadOrStore(f)
+		ref := TargetRef(f)
 		wg.Add(1)
 		go func() {
 			defer func() {
@@ -129,7 +145,17 @@ func runDeps(ctx context.Context, fns []Fn) {
 				}
 				wg.Done()
 			}()
-			if err := fn.run(ctx); err != nil {
+			err, ran := fn.run(ctx, parent, ref)
+			if parent != nil && !ran {
+				parent.state.emit(Event{
+					Kind:            EventTargetSkipped,
+					ExecutionID:     fn.executionID,
+					ParentExecution: parent.execution,
+					Target:          ref,
+					ReusesExecution: fn.executionID,
+				})
+			}
+			if err != nil {
 				mu.Lock()
 				errs = append(errs, fmt.Sprint(err))
 				exit = changeExit(exit, ExitStatus(err))
@@ -178,7 +204,7 @@ func checkFns(fns []interface{}) []Fn {
 // defining its own dependencies.  Functions must have the same signature as a
 // Mage target, i.e. optional context argument, optional error return.
 func Deps(fns ...interface{}) {
-	CtxDeps(context.Background(), fns...)
+	CtxDeps(ambientContext(), fns...)
 }
 
 func changeExit(old, nw int) int {
@@ -215,16 +241,72 @@ type onceFun struct {
 	err  error
 
 	displayName string
+	executionID string
 }
 
-// run will run the function exactly once and capture the error output. Further runs simply return
-// the same error output.
-func (o *onceFun) run(ctx context.Context) error {
+// run will run the function exactly once and capture the error output. Further
+// runs simply return the same error output. It reports whether this caller was
+// the one that actually executed the function body; all other callers reuse
+// the single execution.
+func (o *onceFun) run(ctx context.Context, parent *eventFrame, ref TargetID) (err error, ran bool) {
 	o.once.Do(func() {
+		ran = true
 		if Verbose() {
 			logger.Println("Running dependency:", displayName(o.fn.Name()))
 		}
-		o.err = o.fn.Run(ctx)
+		runCtx := ctx
+		var state *eventState
+		if parent != nil {
+			state = parent.state
+			state.emit(Event{
+				Kind:            EventTargetStarted,
+				ExecutionID:     o.executionID,
+				ParentExecution: parent.execution,
+				Target:          ref,
+			})
+			runCtx = withFrame(ctx, &eventFrame{
+				state:     state,
+				execution: o.executionID,
+				target:    ref,
+			})
+			popAmbient := pushAmbient(eventFrame{
+				state:     state,
+				execution: o.executionID,
+				target:    ref,
+			})
+			defer popAmbient()
+		}
+		func() {
+			defer func() {
+				if value := recover(); value != nil {
+					if state != nil {
+						state.emit(failureEvent(o.executionID, parentExecution(parent), ref, value))
+					}
+					panic(value)
+				}
+			}()
+			o.err = o.fn.Run(runCtx)
+		}()
+		if state != nil {
+			if o.err != nil {
+				state.emit(failureEvent(o.executionID, parentExecution(parent), ref, o.err))
+			} else {
+				state.emit(Event{
+					Kind:            EventTargetCompleted,
+					ExecutionID:     o.executionID,
+					ParentExecution: parentExecution(parent),
+					Target:          ref,
+				})
+			}
+		}
 	})
-	return o.err
+	return o.err, ran
+}
+
+// parentExecution returns the frame's execution id or the empty string.
+func parentExecution(frame *eventFrame) string {
+	if frame == nil {
+		return ""
+	}
+	return frame.execution
 }

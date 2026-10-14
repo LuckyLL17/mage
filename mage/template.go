@@ -10,6 +10,7 @@ package main
 
 import (
 	_context "context"
+	_encodingjson "encoding/json"
 	_flag "flag"
 	_fmt "fmt"
 	_io "io"
@@ -17,9 +18,11 @@ import (
 	_os "os"
 	_signal "os/signal"
 	_filepath "path/filepath"
+	_runtime "runtime"
 	_sort "sort"
 	_strconv "strconv"
 	_strings "strings"
+	_sync "sync"
 	_syscall "syscall"
 	_tabwriter "text/tabwriter"
 	_time "time"
@@ -66,6 +69,174 @@ func main() {
 	fs := _flag.FlagSet{}
 	fs.SetOutput(_os.Stdout)
 
+	// mageTargetID identifies a command line selected target using only
+	// stdlib types.
+	type mageTargetID struct {
+		Name    string
+		Display string
+	}
+
+	// The generated main stays stdlib-only and emits structured events as the
+	// same JSON schema as mg, even for magefiles that do not import mg. The
+	// private _root control line additionally publishes the goroutine and
+	// execution identity of a root target, so mg can associate context-free
+	// Deps calls with it; the mage driver filters control lines out.
+	type mageEvent struct {
+		Time            _time.Time ` + "`" + `json:"time"` + "`" + `
+		Sequence        uint64     ` + "`" + `json:"seq"` + "`" + `
+		Kind            string     ` + "`" + `json:"kind"` + "`" + `
+		RunID           string     ` + "`" + `json:"run_id"` + "`" + `
+		ExecutionID     string     ` + "`" + `json:"execution_id,omitempty"` + "`" + `
+		ParentExecution string     ` + "`" + `json:"parent_execution_id,omitempty"` + "`" + `
+		Target          struct {
+			Name    string ` + "`" + `json:"name"` + "`" + `
+			ID      string ` + "`" + `json:"id,omitempty"` + "`" + `
+			Display string ` + "`" + `json:"display,omitempty"` + "`" + `
+		} ` + "`" + `json:"target"` + "`" + `
+		Error     string ` + "`" + `json:"error,omitempty"` + "`" + `
+		ExitCode  int    ` + "`" + `json:"exit_code,omitempty"` + "`" + `
+		Reason    string ` + "`" + `json:"reason,omitempty"` + "`" + `
+		Goroutine int64  ` + "`" + `json:"goroutine,omitempty"` + "`" + `
+	}
+	var (
+		mageEventFile  *_os.File
+		mageEventMu    _sync.Mutex
+		mageEventSeq   uint64
+		mageEventRunID string
+		mageRootCount  uint64
+	)
+	mageEventInit := func() {
+		path := _os.Getenv("MAGEFILE_EVENT_LOG")
+		if path == "" {
+			return
+		}
+		mageEventRunID = _os.Getenv("MAGEFILE_RUN_ID")
+		if mageEventRunID == "" {
+			mageEventRunID = _strconv.FormatInt(_time.Now().UnixNano(), 16) + "-" + _strconv.Itoa(_os.Getpid())
+		}
+		if file, err := _os.OpenFile(path, _os.O_CREATE|_os.O_WRONLY|_os.O_APPEND, 0o600); err == nil {
+			mageEventFile = file
+		}
+	}
+	mageEventWrite := func(event mageEvent) {
+		if mageEventFile == nil {
+			return
+		}
+		mageEventMu.Lock()
+		defer mageEventMu.Unlock()
+		if mageEventFile == nil {
+			return
+		}
+		mageEventSeq++
+		event.Sequence = mageEventSeq
+		event.Time = _time.Now()
+		event.RunID = mageEventRunID
+		line, err := _encodingjson.Marshal(event)
+		if err != nil {
+			return
+		}
+		line = append(line, '\n')
+		if _, err := mageEventFile.Write(line); err != nil {
+			_ = mageEventFile.Close()
+			mageEventFile = nil
+		}
+	}
+	mageEventExitCode := func(value interface{}) int {
+		type coded interface{ ExitStatus() int }
+		if code, ok := value.(coded); ok {
+			return code.ExitStatus()
+		}
+		return 1
+	}
+	mageEventFor := func(kind, execution string, target mageTargetID) mageEvent {
+		event := mageEvent{Kind: kind, ExecutionID: execution}
+		event.Target.Name = target.Name
+		event.Target.Display = target.Display
+		return event
+	}
+	mageGoroutineID := func() int64 {
+		var buf [64]byte
+		n := _runtime.Stack(buf[:], false)
+		line := string(buf[:n])
+		const prefix = "goroutine "
+		if len(line) <= len(prefix) {
+			return 0
+		}
+		line = line[len(prefix):]
+		end := 0
+		for end < len(line) && line[end] >= '0' && line[end] <= '9' {
+			end++
+		}
+		id, _ := _strconv.ParseInt(line[:end], 10, 64)
+		return id
+	}
+	mageObserveTarget := func(ctx _context.Context, target mageTargetID, fn func(_context.Context) error) (err error) {
+		mageEventMu.Lock()
+		mageRootCount++
+		execution := "root-" + _strconv.FormatUint(mageRootCount, 10)
+		mageEventMu.Unlock()
+		control := mageEventFor("_root", execution, target)
+		control.Goroutine = mageGoroutineID()
+		mageEventWrite(control)
+		mageEventWrite(mageEventFor("target_selected", execution, target))
+		mageEventWrite(mageEventFor("target_started", execution, target))
+		func() {
+			defer func() {
+				if value := recover(); value != nil {
+					failure := mageEventFor("target_failed", execution, target)
+					failure.Error = _fmt.Sprint(value)
+					failure.ExitCode = mageEventExitCode(value)
+					mageEventWrite(failure)
+					panic(value)
+				}
+			}()
+			err = fn(ctx)
+		}()
+		if err != nil {
+			failure := mageEventFor("target_failed", execution, target)
+			failure.Error = err.Error()
+			failure.ExitCode = mageEventExitCode(err)
+			mageEventWrite(failure)
+			return err
+		}
+		mageEventWrite(mageEventFor("target_completed", execution, target))
+		return nil
+	}
+	mageEmitInterrupt := func(target mageTargetID, cause error) {
+		event := mageEventFor("canceled", "", target)
+		if cause != nil {
+			if cause == _context.DeadlineExceeded {
+				event.Kind = "timed_out"
+			}
+			event.Error = cause.Error()
+		}
+		mageEventWrite(event)
+	}
+	mageEmitSelectionError := func(name string, cause error) {
+		event := mageEventFor("target_selected", "", mageTargetID{Name: name, Display: name})
+		event.Reason = "unknown_target"
+		if cause != nil {
+			event.Error = cause.Error()
+		}
+		mageEventWrite(event)
+	}
+	mageEventInit()
+	eventCtx := _context.Background()
+	closeEventLog := func() {
+		mageEventMu.Lock()
+		defer mageEventMu.Unlock()
+		if mageEventFile != nil {
+			_ = mageEventFile.Close()
+			mageEventFile = nil
+		}
+	}
+	exit := func(code int) {
+		mageEventWrite(mageEvent{Kind: "exited", ExitCode: code})
+		closeEventLog()
+		_os.Exit(code)
+	}
+	defer closeEventLog()
+
 	// default flag set with ExitOnError and auto generated PrintDefaults should be sufficient
 	fs.BoolVar(&args.Verbose, "v", parseBool("MAGEFILE_VERBOSE"), "show verbose output when running targets")
 	fs.BoolVar(&args.List, "l", parseBool("MAGEFILE_LIST"), "list targets for this binary")
@@ -88,12 +259,12 @@ Options:
 	}
 	if err := fs.Parse(_os.Args[1:]); err != nil {
 		// flag will have printed out an error already.
-		return
+		exit(0)
 	}
 	args.Args = fs.Args()
 	if args.Help && len(args.Args) == 0 {
 		fs.Usage()
-		return
+		exit(0)
 	}
 		
 	{{.PrintNameFunc}}
@@ -145,16 +316,16 @@ Options:
 	getContext := func() (_context.Context, func()) {
 		if ctx == nil {
 			if args.Timeout != 0 {
-				ctx, ctxCancel = _context.WithTimeout(_context.Background(), args.Timeout)
+				ctx, ctxCancel = _context.WithTimeout(eventCtx, args.Timeout)
 			} else {
-				ctx, ctxCancel = _context.WithCancel(_context.Background())
+				ctx, ctxCancel = _context.WithCancel(eventCtx)
 			}
 		}
 
 		return ctx, ctxCancel
 	}
 
-	runTarget := func(logger *_log.Logger, fn func(_context.Context) error) interface{} {
+	runTarget := func(logger *_log.Logger, target mageTargetID, fn func(_context.Context) error) interface{} {
 		var err interface{}
 		ctx, cancel := getContext()
 		d := make(chan interface{})
@@ -163,14 +334,14 @@ Options:
 				err := recover()
 				d <- err
 			}()
-			err := fn(ctx)
-			d <- err
+			d <- mageObserveTarget(ctx, target, fn)
 		}()
 		sigCh := make(chan _os.Signal, 1)
 		_signal.Notify(sigCh, _syscall.SIGINT)
 		select {
 		case <-sigCh:
 			logger.Println("cancelling mage targets, waiting up to 5 seconds for cleanup...")
+			mageEmitInterrupt(target, _context.Canceled)
 			cancel()
 			cleanupCh := _time.After(5 * _time.Second)
 
@@ -180,15 +351,20 @@ Options:
 				return err
 			// cleanup timeout exceeded
 			case <-cleanupCh:
-				return _fmt.Errorf("cleanup timeout exceeded")
+				cleanupErr := _fmt.Errorf("cleanup timeout exceeded")
+				mageEmitInterrupt(target, cleanupErr)
+				return cleanupErr
 			// second SIGINT received
 			case <-sigCh:
 				logger.Println("exiting mage")
-				return _fmt.Errorf("exit forced")
+				forcedErr := _fmt.Errorf("exit forced")
+				mageEmitInterrupt(target, forcedErr)
+				return forcedErr
 			}
 		case <-ctx.Done():
 			cancel()
 			e := ctx.Err()
+			mageEmitInterrupt(target, e)
 			_fmt.Printf("ctx err: %v\n", e)
 			return e
 		case err = <-d:
@@ -208,9 +384,9 @@ Options:
 				ExitStatus() int
 			}
 			if c, ok := err.(code); ok {
-				_os.Exit(c.ExitStatus())
+				exit(c.ExitStatus())
 			}
-			_os.Exit(1)
+			exit(1)
 		}
 	}
 	_ = handleError
@@ -230,15 +406,15 @@ Options:
 	if args.List {
 		if err := list(); err != nil {
 			_log.Println(err)
-			_os.Exit(1)
+			exit(1)
 		}
-		return
+		exit(0)
 	}
 
 	if args.Help {
 		if len(args.Args) < 1 {
 			logger.Println("no target specified")
-			_os.Exit(2)
+			exit(2)
 		}
 		switch _strings.ToLower(args.Args[0]) {
 			{{range .Funcs -}}
@@ -260,7 +436,7 @@ Options:
 					_sort.Strings(aliases)
 					_fmt.Printf("Aliases: %s\n\n", _strings.Join(aliases, ", "))
 				}
-				return
+				exit(0)
 			{{end -}}
 			{{range .Imports -}}
 				{{range .Info.Funcs -}}
@@ -282,12 +458,13 @@ Options:
 					_sort.Strings(aliases)
 					_fmt.Printf("Aliases: %s\n\n", _strings.Join(aliases, ", "))
 				}
-				return
+				exit(0)
 				{{end -}}
 			{{end -}}
 			default:
 				logger.Printf("Unknown target: %q\n", args.Args[0])
-				_os.Exit(2)
+				mageEmitSelectionError(args.Args[0], _fmt.Errorf("unknown target: %q", args.Args[0]))
+				exit(2)
 		}
 	}
 	if len(args.Args) < 1 {
@@ -296,19 +473,19 @@ Options:
 		if ignoreDefault {
 			if err := list(); err != nil {
 				logger.Println("Error:", err)
-				_os.Exit(1)
+				exit(1)
 			}
-			return
+			exit(0)
 		}
 		{{.DefaultFunc.ExecCode}}
 		handleError(logger, ret)
-		return
+		exit(0)
 	{{- else}}
 		if err := list(); err != nil {
 			logger.Println("Error:", err)
-			_os.Exit(1)
+			exit(1)
 		}
-		return
+		exit(0)
 	{{- end}}
 	}
 	for x := 0; x < len(args.Args); {
@@ -331,7 +508,7 @@ Options:
 					// note that expected and args at this point include the arg for the target itself
 					// so we subtract 1 here to show the number of args without the target.
 					logger.Printf("not enough arguments for target \"{{.TargetName}}\", expected %v, got %v\n", expected-1, len(args.Args)-1)
-					_os.Exit(2)
+					exit(2)
 				}
 				if args.Verbose {
 					logger.Println("Running target:", "{{.TargetName}}")
@@ -348,7 +525,7 @@ Options:
 						// note that expected and args at this point include the arg for the target itself
 						// so we subtract 1 here to show the number of args without the target.
 						logger.Printf("not enough arguments for target \"{{.TargetName}}\", expected %v, got %v\n", expected-1, len(args.Args)-1)
-						_os.Exit(2)
+						exit(2)
 					}
 					if args.Verbose {
 						logger.Println("Running target:", "{{.TargetName}}")
@@ -359,9 +536,11 @@ Options:
 		{{- end}}
 		default:
 			logger.Printf("Unknown target specified: %q\n", target)
-			_os.Exit(2)
+			mageEmitSelectionError(target, _fmt.Errorf("unknown target specified: %q", target))
+			exit(2)
 		}
 	}
+	exit(0)
 }
 
 
