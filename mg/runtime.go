@@ -49,6 +49,15 @@ const EnableColorEnv = "MAGEFILE_ENABLE_COLOR"
 // descriptions are retained in mage's help and list output.
 const MultilineEnv = "MAGEFILE_MULTILINE"
 
+// ImportLockEnv is the environment variable that enables validation of
+// resolved mage:import targets against an import lock file before mage
+// executes, lists, autocompletes, shows help for or compiles targets.
+const ImportLockEnv = "MAGEFILE_IMPORTLOCK"
+
+// ImportLockFileEnv is the environment variable that overrides the location
+// of the import lock file.
+const ImportLockFileEnv = "MAGEFILE_IMPORTLOCK_FILE"
+
 // TargetColorEnv is the environment variable that indicates which ANSI color
 // should be used to colorize mage targets. This is only applicable when
 // the MAGEFILE_ENABLE_COLOR environment variable is true.
@@ -104,6 +113,19 @@ func HashFast() bool {
 func Multiline() bool {
 	b, _ := strconv.ParseBool(os.Getenv(MultilineEnv))
 	return b
+}
+
+// ImportLock reports whether the user has requested that mage validate the
+// resolution of mage:import targets against an import lock file before
+// running.
+func ImportLock() bool {
+	b, _ := strconv.ParseBool(os.Getenv(ImportLockEnv))
+	return b
+}
+
+// ImportLockFile reports the user-configured import lock file path, if any.
+func ImportLockFile() string {
+	return os.Getenv(ImportLockFileEnv)
 }
 
 // IgnoreDefault reports whether the user has requested to ignore the default target

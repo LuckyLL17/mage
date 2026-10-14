@@ -651,10 +651,19 @@ func funcFromDoc(f *doc.Func, importpath, funcname string, multiline bool, field
 	return fn, true
 }
 
-func setImports(gocmd string, pi *PkgInfo) error {
-	importNames := map[string]string{}
-	rootImports := []string{}
-	for _, f := range pi.AstPkg.Files {
+// mageImportSpec is a single //mage:import directive found in a package.
+type mageImportSpec struct {
+	Path  string
+	Alias string // empty when the package is imported at the root
+}
+
+// mageImportSpecs returns all //mage:import directives declared by the
+// given package: root imports first, then aliased imports, each group
+// sorted by path for deterministic resolution.
+func mageImportSpecs(pkg *ast.Package) []mageImportSpec {
+	var named []mageImportSpec
+	var roots []mageImportSpec
+	for _, f := range pkg.Files {
 		for _, d := range f.Decls {
 			gen, ok := d.(*ast.GenDecl)
 			if !ok || gen.Tok != token.IMPORT {
@@ -669,18 +678,40 @@ func setImports(gocmd string, pi *PkgInfo) error {
 				if len(gen.Specs) == 1 && gen.Lparen == token.NoPos && impspec.Doc == nil {
 					impspec.Doc = gen.Doc
 				}
-				name, alias, ok := getImportPath(impspec)
+				path, alias, ok := getImportPath(impspec)
 				if !ok {
 					continue
 				}
 				if alias != "" {
-					debug.Printf("found %s: %s (%s)", importTag, name, alias)
-					importNames[name] = alias
+					debug.Printf("found %s: %s (%s)", importTag, path, alias)
+					named = append(named, mageImportSpec{Path: path, Alias: alias})
 				} else {
-					debug.Printf("found %s: %s", importTag, name)
-					rootImports = append(rootImports, name)
+					debug.Printf("found %s: %s", importTag, path)
+					roots = append(roots, mageImportSpec{Path: path})
 				}
 			}
+		}
+	}
+	// ast.Package.Files is a map, so file iteration order is random; sort
+	// both groups for deterministic resolution and lock output.
+	sort.Slice(named, func(i, j int) bool {
+		if named[i].Path != named[j].Path {
+			return named[i].Path < named[j].Path
+		}
+		return named[i].Alias < named[j].Alias
+	})
+	sort.Slice(roots, func(i, j int) bool { return roots[i].Path < roots[j].Path })
+	return append(roots, named...)
+}
+
+func setImports(gocmd string, pi *PkgInfo) error {
+	importNames := map[string]string{}
+	var rootImports []string
+	for _, spec := range mageImportSpecs(pi.AstPkg) {
+		if spec.Alias != "" {
+			importNames[spec.Path] = spec.Alias
+		} else {
+			rootImports = append(rootImports, spec.Path)
 		}
 	}
 	imports, err := getNamedImports(gocmd, importNames, pi.Multiline)

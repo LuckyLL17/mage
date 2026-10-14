@@ -79,13 +79,18 @@ type Command int
 
 // The various command types.
 const (
-	None          Command = iota
-	Version               // report the current version of mage
-	Init                  // create a starting template for mage
-	Clean                 // clean out old compiled mage binaries from the cache
-	CompileStatic         // compile a static binary of the current directory
-	Install               // install shell tab completion
+	None             Command = iota
+	Version                  // report the current version of mage
+	Init                     // create a starting template for mage
+	Clean                    // clean out old compiled mage binaries from the cache
+	CompileStatic            // compile a static binary of the current directory
+	Install                  // install shell tab completion
+	UpdateImportLock         // (re)generate the mage:import lock file
 )
+
+// defaultImportLockFile is the lock file name used when neither
+// -importlockfile nor MAGEFILE_IMPORTLOCK_FILE is set.
+const defaultImportLockFile = "mage.lock.json"
 
 // Main is the entrypoint for running mage.  It exists external to mage's main
 // function to allow it to be used from other programs, specifically so you can
@@ -96,30 +101,49 @@ func Main() int {
 
 // Invocation contains the args for invoking a run of Mage.
 type Invocation struct {
-	Debug        bool          // turn on debug messages
-	Dir          string        // directory to read magefiles from
-	WorkDir      string        // directory where magefiles will run
-	Force        bool          // forces recreation of the compiled binary
-	Verbose      bool          // tells the magefile to print out log statements
-	List         bool          // tells the magefile to print out a list of targets
-	Help         bool          // tells the magefile to print out help for a specific target
-	Keep         bool          // tells mage to keep the generated main file after compiling
-	Timeout      time.Duration // tells mage to set a timeout to running the targets
-	CompileOut   string        // tells mage to compile a static binary to this path, but not execute
-	GOOS         string        // sets the GOOS when producing a binary with -compileout
-	GOARCH       string        // sets the GOARCH when producing a binary with -compileout
-	Ldflags      string        // sets the ldflags when producing a binary with -compileout
-	Stdout       io.Writer     // writer to write stdout messages to
-	Stderr       io.Writer     // writer to write stderr messages to
-	Stdin        io.Reader     // reader to read stdin from
-	Args         []string      // args to pass to the compiled binary
-	GoCmd        string        // the go binary command to run
-	CacheDir     string        // the directory where we should store compiled binaries
-	HashFast     bool          // don't rely on GOCACHE, just hash the magefiles
-	Multiline    bool          // whether to retain line returns in help text for the generated main file
-	Autocomplete bool          // parse magefiles and print target names for shell completion
-	InstallShell string        // shell to install tab completion for (bash, zsh, fish, powershell/pwsh)
+	// Fields are grouped by type to keep Invocation compact; it is passed by
+	// value through mage's public API, so padding matters.
+	Dir            string         // directory to read magefiles from
+	WorkDir        string         // directory where magefiles will run
+	CompileOut     string         // tells mage to compile a static binary to this path, but not execute
+	GOOS           string         // sets the GOOS when producing a binary with -compileout
+	GOARCH         string         // sets the GOARCH when producing a binary with -compileout
+	Ldflags        string         // sets the ldflags when producing a binary with -compileout
+	GoCmd          string         // the go binary command to run
+	CacheDir       string         // the directory where we should store compiled binaries
+	InstallShell   string         // shell to install tab completion for (bash, zsh, fish, powershell/pwsh)
+	Stdout         io.Writer      // writer to write stdout messages to
+	Stderr         io.Writer      // writer to write stderr messages to
+	Stdin          io.Reader      // reader to read stdin from
+	Args           []string       // args to pass to the compiled binary
+	Timeout        time.Duration  // tells mage to set a timeout to running the targets
+	Debug          bool           // turn on debug messages
+	Force          bool           // forces recreation of the compiled binary
+	Verbose        bool           // tells the magefile to print out log statements
+	List           bool           // tells the magefile to print out a list of targets
+	Help           bool           // tells the magefile to print out help for a specific target
+	Keep           bool           // tells mage to keep the generated main file after compiling
+	HashFast       bool           // don't rely on GOCACHE, just hash the magefiles
+	Multiline      bool           // whether to retain line returns in help text for the generated main file
+	Autocomplete   bool           // parse magefiles and print target names for shell completion
+	ImportLockMode ImportLockMode // mage:import lock behavior, see the ImportLock* constants
 }
+
+// ImportLockMode selects mage:import lock behavior for an Invocation. The
+// lock file location is taken from MAGEFILE_IMPORTLOCK_FILE and defaults to
+// mage.lock.json in the magefiles directory.
+type ImportLockMode uint8
+
+// Supported mage:import lock modes.
+const (
+	// ImportLockOff leaves mage:import resolution unlocked, mage's default.
+	ImportLockOff ImportLockMode = iota
+	// ImportLockUpdate atomically (re)generates the lock file and exits.
+	ImportLockUpdate
+	// ImportLockValidate validates mage:import resolution against the lock
+	// file before executing, listing, completing, helping or compiling.
+	ImportLockValidate
+)
 
 // MagefilesDirName is the name of the default folder to look for if no directory was specified,
 // if this folder exists it will be assumed mage package lives inside it.
@@ -171,7 +195,7 @@ func ParseAndRun(stdout, stderr io.Writer, stdin io.Reader, args []string) int {
 			return 1
 		}
 		return 0
-	case CompileStatic, None:
+	case CompileStatic, None, UpdateImportLock:
 		return Invoke(inv)
 	default:
 		errlog.Printf("unknown command type: %v", cmd)
@@ -231,6 +255,10 @@ func Parse(stderr, stdout io.Writer, args []string) (inv Invocation, cmd Command
 	fs.StringVar(&inv.GOARCH, "goarch", "", "set GOARCH for binary produced with -compile")
 	fs.StringVar(&inv.Ldflags, "ldflags", "", "set ldflags for binary produced with -compile")
 	fs.BoolVar(&inv.Autocomplete, "autocomplete", false, "print target names for shell completion, without compiling")
+	var importLockEnabled bool
+	fs.BoolVar(&importLockEnabled, "importlock", mg.ImportLock(), "validate mage:import resolution against the lock file before running, listing, completing, helping or compiling")
+	var importLockFile string
+	fs.StringVar(&importLockFile, "importlockfile", "", "path to the mage:import lock file")
 
 	// commands below
 
@@ -245,6 +273,8 @@ func Parse(stderr, stdout io.Writer, args []string) (inv Invocation, cmd Command
 	fs.StringVar(&compileOutPath, "compile", "", "output a static binary to the given path")
 	var installShell string
 	fs.StringVar(&installShell, "install", "", "install shell tab completion (bash, zsh, fish, powershell/pwsh)")
+	var importLockUpdate bool
+	fs.BoolVar(&importLockUpdate, "importlockupdate", false, "generate or update the mage:import lock file")
 
 	fs.Usage = func() {
 		_, _ = fmt.Fprint(stdout, `
@@ -259,6 +289,8 @@ Commands:
   -compile <string>
             output a static binary to the given path
   -h        show this help
+  -importlockupdate
+            generate or update the mage:import lock file
   -init     create a starting template if no mage files exist
   -install <string>
             install shell tab completion (bash, zsh, fish, powershell/pwsh)
@@ -266,14 +298,17 @@ Commands:
   -version  show version info for the mage binary
 
 Options:
-  -d <string> 
+  -d <string>
               directory to read magefiles from (default "." or "magefiles" if exists)
   -debug      turn on debug messages
   -f          force recreation of compiled magefile
   -goarch     sets the GOARCH for the binary created by -compile (default: current arch)
   -gocmd <string>
-		      use the given go binary to compile the output (default: "go")
+	      use the given go binary to compile the output (default: "go")
   -goos       sets the GOOS for the binary created by -compile (default: current OS)
+  -importlock validate mage:import resolution against the lock file before running
+  -importlockfile <string>
+              path to the mage:import lock file (default "mage.lock.json" in the magefiles directory)
   -ldflags    sets the ldflags for the binary created by -compile (default: "")
   -multiline  retain line returns in help docs (default: convert to spaces)
   -h          show description of a target
@@ -290,6 +325,11 @@ Options:
 		// parse will have already called fs.Usage()
 		return inv, cmd, err
 	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "importlockfile" {
+			_ = os.Setenv(mg.ImportLockFileEnv, importLockFile)
+		}
+	})
 	if err == nil && inv.Help && len(fs.Args()) == 0 {
 		fs.Usage()
 		// tell upstream, to just exit
@@ -317,8 +357,11 @@ Options:
 		numCommands++
 		cmd = Clean
 		if fs.NArg() > 0 {
-			return inv, cmd, errors.New("-h, -init, -clean, -compile, -install, -autocomplete and -version cannot be used simultaneously")
+			return inv, cmd, errors.New("-h, -init, -clean, -compile, -install, -importlockupdate, -autocomplete and -version cannot be used simultaneously")
 		}
+	case importLockUpdate:
+		numCommands++
+		cmd = UpdateImportLock
 	default:
 		// no command flags set
 	}
@@ -337,7 +380,7 @@ Options:
 
 	if numCommands > 1 {
 		debug.Printf("%d commands defined", numCommands)
-		return inv, cmd, errors.New("-h, -init, -clean, -compile, -install, -autocomplete and -version cannot be used simultaneously")
+		return inv, cmd, errors.New("-h, -init, -clean, -compile, -install, -importlockupdate, -autocomplete and -version cannot be used simultaneously")
 	}
 
 	if cmd != CompileStatic && (inv.GOARCH != "" || inv.GOOS != "") {
@@ -352,6 +395,14 @@ Options:
 	if len(inv.Args) > 0 && cmd != None {
 		return inv, cmd, fmt.Errorf("unexpected arguments to command: %q", inv.Args)
 	}
+	switch {
+	case cmd == UpdateImportLock:
+		inv.ImportLockMode = ImportLockUpdate
+	case importLockEnabled:
+		inv.ImportLockMode = ImportLockValidate
+	default:
+		// locking stays disabled, preserving mage's default behavior
+	}
 	inv.HashFast = mg.HashFast()
 	return inv, cmd, err
 }
@@ -360,6 +411,51 @@ const dotDirectory = "."
 
 //go:embed colors.go
 var colorsFile string
+
+// useBuildCache reports whether mage must ignore any existing compiled
+// binary: when GOCACHE is set, rebuilding always picks up changed transitive
+// dependencies. ok is false when the decision could not be made.
+func useBuildCache(inv Invocation, errlog *log.Logger) (useCache, ok bool) {
+	if inv.HashFast {
+		debug.Println("user has set MAGEFILE_HASHFAST, so we'll ignore GOCACHE")
+		return false, true
+	}
+	gocache, err := internal.OutputDebug(inv.GoCmd, "env", "GOCACHE")
+	if err != nil {
+		errlog.Printf("failed to run %s env GOCACHE: %s", inv.GoCmd, err)
+		return false, false
+	}
+	if gocache != "" {
+		debug.Println("go build cache exists, will ignore any compiled binary")
+		return true, true
+	}
+	return false, true
+}
+
+// runExistingExe runs an already compiled mage binary when one can be reused.
+// ran is false when mage should compile a fresh binary instead. Import
+// locking always forces a fresh parse, so a locked invocation never reuses
+// the binary before validation runs.
+func runExistingExe(inv Invocation, useCache bool, exePath string, errlog *log.Logger) (code int, ran bool) {
+	if useCache {
+		return 0, false
+	}
+	_, err := os.Stat(exePath)
+	switch {
+	case err == nil:
+		if !inv.Force && inv.ImportLockMode == ImportLockOff {
+			debug.Println("Running existing exe")
+			return RunCompiled(inv, exePath, errlog), true
+		}
+		debug.Println("ignoring existing executable")
+	case os.IsNotExist(err):
+		debug.Println("no existing exe, creating new")
+	default:
+		debug.Printf("error reading existing exe at %v: %v", exePath, err)
+		debug.Println("creating new exe")
+	}
+	return 0, false
+}
 
 // Invoke runs Mage with the given arguments.
 func Invoke(inv Invocation) int {
@@ -391,6 +487,10 @@ func Invoke(inv Invocation) int {
 	if inv.CacheDir == "" {
 		inv.CacheDir = mg.CacheDir()
 	}
+	lockFile := mg.ImportLockFile()
+	if lockFile == "" {
+		lockFile = filepath.Join(inv.Dir, defaultImportLockFile)
+	}
 
 	files, err := Magefiles(inv.Dir, inv.GOOS, inv.GOARCH, inv.UsesMagefiles())
 	if err != nil {
@@ -413,39 +513,12 @@ func Invoke(inv Invocation) int {
 	}
 	debug.Println("output exe is ", exePath)
 
-	useCache := false
-	if inv.HashFast {
-		debug.Println("user has set MAGEFILE_HASHFAST, so we'll ignore GOCACHE")
-	} else {
-		gocache, gocacheErr := internal.OutputDebug(inv.GoCmd, "env", "GOCACHE")
-		if gocacheErr != nil {
-			errlog.Printf("failed to run %s env GOCACHE: %s", inv.GoCmd, gocacheErr)
-			return 1
-		}
-
-		// if GOCACHE exists, always rebuild, so we catch transitive
-		// dependencies that have changed.
-		if gocache != "" {
-			debug.Println("go build cache exists, will ignore any compiled binary")
-			useCache = true
-		}
+	useCache, ok := useBuildCache(inv, errlog)
+	if !ok {
+		return 1
 	}
-
-	if !useCache {
-		_, err = os.Stat(exePath)
-		switch {
-		case err == nil:
-			if !inv.Force {
-				debug.Println("Running existing exe")
-				return RunCompiled(inv, exePath, errlog)
-			}
-			debug.Println("ignoring existing executable")
-		case os.IsNotExist(err):
-			debug.Println("no existing exe, creating new")
-		default:
-			debug.Printf("error reading existing exe at %v: %v", exePath, err)
-			debug.Println("creating new exe")
-		}
+	if code, ran := runExistingExe(inv, useCache, exePath, errlog); ran {
+		return code
 	}
 
 	// parse wants dir + filenames... arg
@@ -461,6 +534,15 @@ func Invoke(inv Invocation) int {
 	if err != nil {
 		errlog.Println("Error parsing magefiles:", err)
 		return 1
+	}
+
+	// Import locking is resolved exactly once here, so execution, target
+	// listing, help, autocomplete and compilation all act on the same
+	// validation result.
+	if inv.ImportLockMode != ImportLockOff {
+		if code, ok := reconcileImportLock(inv.ImportLockMode, lockFile, inv.GoCmd, inv.Stdout, info, errlog); !ok {
+			return code
+		}
 	}
 
 	if inv.Autocomplete {
@@ -542,6 +624,43 @@ func Invoke(inv Invocation) int {
 	}
 
 	return RunCompiled(inv, exePath, errlog)
+}
+
+// reconcileImportLock resolves the mage:import graph once and either
+// atomically writes the lock file (-importlockupdate) or validates the
+// current resolution against the existing lock file. It returns ok=false
+// when Invoke must terminate, along with the exit code to use.
+func reconcileImportLock(mode ImportLockMode, lockFile, gocmd string, stdout io.Writer, info *parse.PkgInfo, errlog *log.Logger) (code int, ok bool) {
+	snapshot, errs := parse.ImportLockSnapshot(gocmd, info)
+	if len(errs) != 0 {
+		for _, e := range errs {
+			errlog.Println("Error:", e)
+		}
+		return 1, false
+	}
+	if mode == ImportLockUpdate {
+		if err := parse.WriteLockFile(lockFile, snapshot); err != nil {
+			errlog.Println("Error:", err)
+			return 1, false
+		}
+		out := log.New(stdout, "", 0)
+		out.Println("import lock written to", lockFile)
+		return 0, false
+	}
+	locked, err := parse.ReadLockFile(lockFile)
+	if os.IsNotExist(err) {
+		errlog.Printf("import lock file %q not found; run \"mage -importlockupdate\" to create it, or run without -importlock to skip locking", lockFile)
+		return 1, false
+	}
+	if err != nil {
+		errlog.Println("Error:", err)
+		return 1, false
+	}
+	if err := locked.Validate(snapshot); err != nil {
+		errlog.Println("Error:", err)
+		return 1, false
+	}
+	return 0, true
 }
 
 func mageListOutput(data mainfileTemplateData, info *parse.PkgInfo) string {
